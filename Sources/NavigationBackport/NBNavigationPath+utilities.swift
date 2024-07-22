@@ -4,7 +4,9 @@ public extension NBNavigationPath {
   /// Pushes a new screen via a push navigation.
   /// - Parameter screen: The screen to push.
   mutating func push(_ screen: AnyHashable) {
-    elements.push(screen)
+      if elements.last != screen {
+          elements.push(screen)
+      }
   }
 
   /// Pops a given number of screens off the stack.

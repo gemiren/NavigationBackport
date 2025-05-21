@@ -8,7 +8,12 @@ public struct NBNavigationStack<Root: View, Data: Hashable>: View {
   @State var internalTypedPath: [Data] = []
   @StateObject var path: NavigationPathHolder
   @StateObject var destinationBuilder = DestinationBuilderHolder()
+  @StateObject var navigator: Navigator<Data> = .init(.constant([]))
   @Environment(\.useNavigationStack) var useNavigationStack
+  // NOTE: Using `Environment(\.scenePhase)` doesn't work if the app uses UIKIt lifecycle events (via AppDelegate/SceneDelegate).
+  // We do not need to re-render the view when appIsActive changes, and doing so can cause animation glitches, so it is wrapped
+  // in `NonReactiveState`.
+  @State var appIsActive = NonReactiveState(value: true)
   var root: Root
   var useInternalTypedPath: Bool
 
@@ -23,10 +28,11 @@ public struct NBNavigationStack<Root: View, Data: Hashable>: View {
   @ViewBuilder
   var content: some View {
     if #available(iOS 16.0, *, macOS 13.0, *, watchOS 9.0, *, tvOS 16.0, *), useNavigationStack == .whenAvailable {
-      NavigationStack(path: $path.path) {
+      NavigationStack(path: useInternalTypedPath ? $internalTypedPath : $externalTypedPath) {
         root
-          .navigationDestination(for: AnyHashable.self, destination: { destinationBuilder.build($0) })
-          .navigationDestination(for: LocalDestinationID.self, destination: { destinationBuilder.build($0) })
+          .navigationDestination(for: LocalDestinationID.self, destination: { DestinationBuilderView(data: $0) })
+          .navigationDestination(for: Data.self, destination: { DestinationBuilderView(data: $0) })
+          .anyHashableNavigationDestination(for: Data.self, destination: { DestinationBuilderView(data: $0) })
       }
       .environment(\.isWithinNavigationStack, true)
     } else {
@@ -43,10 +49,15 @@ public struct NBNavigationStack<Root: View, Data: Hashable>: View {
       .environmentObject(path)
       .environmentObject(Unobserved(object: path))
       .environmentObject(destinationBuilder)
-      .environmentObject(Navigator(useInternalTypedPath ? $internalTypedPath : $externalTypedPath))
+      .environmentObject(navigator)
+      .onFirstAppear {
+        if useInternalTypedPath {
+          // We can only access the StateObject once the view has been added to the view tree.
+          navigator.pathBinding = $internalTypedPath
+        }
+      }
       .onFirstAppear {
         guard isUsingNavigationView else {
-          // Path should already be correct thanks to initialiser.
           return
         }
         // For NavigationView, only initialising with one pushed screen is supported.
@@ -58,18 +69,20 @@ public struct NBNavigationStack<Root: View, Data: Hashable>: View {
       }
       .onChange(of: externalTypedPath) { externalTypedPath in
         guard isUsingNavigationView else {
-          path.path = externalTypedPath
           return
         }
+        guard path.path != externalTypedPath.map({ $0 }) else { return }
+        guard appIsActive.value else { return }
         path.withDelaysIfUnsupported(\.path) {
           $0 = externalTypedPath
         }
       }
       .onChange(of: internalTypedPath) { internalTypedPath in
         guard isUsingNavigationView else {
-          path.path = internalTypedPath
           return
         }
+        guard path.path != internalTypedPath.map({ $0 }) else { return }
+        guard appIsActive.value else { return }
         path.withDelaysIfUnsupported(\.path) {
           $0 = internalTypedPath
         }
@@ -97,6 +110,29 @@ public struct NBNavigationStack<Root: View, Data: Hashable>: View {
           }
         }
       }
+    #if os(iOS)
+      .onReceive(NotificationCenter.default.publisher(for: didBecomeActive)) { _ in
+        appIsActive.value = true
+        guard isUsingNavigationView else { return }
+        path.withDelaysIfUnsupported(\.path) {
+          $0 = useInternalTypedPath ? internalTypedPath : externalTypedPath
+        }
+      }
+      .onReceive(NotificationCenter.default.publisher(for: willResignActive)) { _ in
+        appIsActive.value = false
+      }
+    #elseif os(tvOS)
+      .onReceive(NotificationCenter.default.publisher(for: didBecomeActive)) { _ in
+        appIsActive.value = true
+        guard isUsingNavigationView else { return }
+        path.withDelaysIfUnsupported(\.path) {
+          $0 = useInternalTypedPath ? internalTypedPath : externalTypedPath
+        }
+      }
+      .onReceive(NotificationCenter.default.publisher(for: willResignActive)) { _ in
+        appIsActive.value = false
+      }
+    #endif
   }
 
   public init(path: Binding<[Data]>?, @ViewBuilder root: () -> Root) {
@@ -104,6 +140,9 @@ public struct NBNavigationStack<Root: View, Data: Hashable>: View {
     self.root = root()
     _path = StateObject(wrappedValue: NavigationPathHolder(path: path?.wrappedValue ?? []))
     useInternalTypedPath = path == nil
+
+    let navigator = useInternalTypedPath ? Navigator(.constant([])) : Navigator($externalTypedPath)
+    _navigator = StateObject(wrappedValue: navigator)
   }
 }
 
@@ -117,7 +156,7 @@ public extension NBNavigationStack where Data == AnyHashable {
   init(path: Binding<NBNavigationPath>, @ViewBuilder root: () -> Root) {
     let path = Binding(
       get: { path.wrappedValue.elements },
-      set: { path.wrappedValue.elements = $0 }
+      set: { path.transaction($1).wrappedValue.elements = $0 }
     )
     self.init(path: path, root: root)
   }
@@ -129,4 +168,30 @@ var supportedNavigationViewStyle: some NavigationViewStyle {
   #else
     .stack
   #endif
+}
+
+#if os(iOS)
+  private let didBecomeActive = UIApplication.didBecomeActiveNotification
+  private let willResignActive = UIApplication.willResignActiveNotification
+#elseif os(tvOS)
+  private let didBecomeActive = UIApplication.didBecomeActiveNotification
+  private let willResignActive = UIApplication.willResignActiveNotification
+#endif
+
+@available(iOS 16.0, macOS 13.0, watchOS 9.0, *, tvOS 16.0, *)
+extension View {
+  @ViewBuilder
+  func anyHashableNavigationDestination<D, C>(
+    for data: D.Type,
+    @ViewBuilder destination: @escaping (D) -> C
+  ) -> some View where D: Hashable, C: View {
+    if ObjectIdentifier(D.self) == ObjectIdentifier(AnyHashable.self) {
+      // No need to add AnyHashable navigation destination as it's already been added as the Data
+      // navigation destination.
+      self
+    } else {
+      // Including this ensures that `PathNavigator` can always be used.
+      navigationDestination(for: AnyHashable.self, destination: { DestinationBuilderView(data: $0) })
+    }
+  }
 }
